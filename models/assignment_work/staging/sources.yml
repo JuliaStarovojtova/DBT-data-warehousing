@@ -9,4 +9,8 @@ sources:
         description: |
           NYC 311 service requests for Dept of Transportation.
           One row per service request.
+      - name: source_nyc_dob_job_apps
+        description: |
+          List of job application filings filed in Dept of Building
+          One row per job application filing.
       
