@@ -4,5 +4,5 @@
      created_date,
      complaint_type,
      borough
- FROM {{ source('raw', 'source_service_requests_homework') }}
+ FROM {{ source('raw', 'SOURCE-TABLE-NAME-HERE') }}
  LIMIT 10
