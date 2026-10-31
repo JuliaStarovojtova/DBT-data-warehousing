@@ -21,6 +21,7 @@ cleaned AS (
            street_name,
            borough,
            postcode,
+           zip,  -- raw "zip" is the building OWNER's zip, not needed; job-site zip comes from postcode
            bin,
            commmunity_board,
            council_district,
@@ -142,3 +143,4 @@ cleaned AS (
  
 SELECT * FROM cleaned
 -- All should be part of this table after running: stg_nyc_dob_job_filings
+ 
