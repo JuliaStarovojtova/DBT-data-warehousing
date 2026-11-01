@@ -18,6 +18,7 @@ cleaned AS (
            approved_date,
            first_permit_date,
            signoff_date,
+           current_status_date,
            house_no,
            street_name,
            borough,
@@ -53,6 +54,7 @@ cleaned AS (
        CAST(approved_date AS TIMESTAMP) AS approved_date,
        CAST(first_permit_date AS TIMESTAMP) AS first_permit_date,
        CAST(signoff_date AS TIMESTAMP) AS signoff_date,
+       CAST(current_status_date AS TIMESTAMP) AS current_status_date,
  
        -- Filing details
        UPPER(TRIM(CAST(filing_status AS STRING))) AS filing_status,
