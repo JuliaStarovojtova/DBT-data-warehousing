@@ -60,6 +60,6 @@ null_placeholder AS (
 
 )
 
-SELECT * FROM FROM location_dimension
+SELECT * FROM location_dimension
 UNION ALL
-SELECT * FROM FROM null_placeholder
+SELECT * FROM null_placeholder
