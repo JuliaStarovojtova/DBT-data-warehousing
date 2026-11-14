@@ -13,12 +13,12 @@ cleaned AS (
            unique_key,
            created_date,
            closed_date,
-           resolution_action_updated_date,   --  cast to TIMESTAMP below
+           resolution_action_updated_date,   -- [CHANGE 1] cast to TIMESTAMP below
            agency,
            agency_name,
            complaint_type,
            descriptor,
-           descriptor_2,                     -- 'N/A' -> NULL below
+           descriptor_2,                     -- [CHANGE 2] 'N/A' -> NULL below
            status,
            incident_zip,
            borough,
@@ -26,12 +26,12 @@ cleaned AS (
            street_name,
            cross_street_1,
            cross_street_2,
-           intersection_street_1,            --  extra spaces cleaned below
-           intersection_street_2,             
-           community_board,                  --  'Unspecified' -> NULL below
-           park_borough,                     
-           park_facility_name,               
-           police_precinct,                  
+           intersection_street_1,            -- [CHANGE 3] extra spaces cleaned below
+           intersection_street_2,            -- [CHANGE 3]
+           community_board,                  -- [CHANGE 2] 'Unspecified' -> NULL below
+           park_borough,                     -- [CHANGE 2]
+           park_facility_name,               -- [CHANGE 2]
+           police_precinct,                  -- [CHANGE 2]
            latitude,
            longitude,
            open_data_channel_type
@@ -47,9 +47,12 @@ cleaned AS (
 
        -- Date/Time
        CAST(created_date AS TIMESTAMP) AS created_date,
-       DATE(CAST(created_date AS TIMESTAMP)) AS created_on,  -- new: date only, for joins and comparisons with inspections
        CAST(closed_date AS TIMESTAMP) AS closed_date,
        CAST(resolution_action_updated_date AS TIMESTAMP) AS resolution_action_updated_date, -- [CHANGE 1]
+       -- [ERD] date-only versions, used to build created_date_key / closed_date_key -> dim_date
+       -- (plain DATE(): the times are already NYC local time, so no time zone conversion)
+       DATE(CAST(created_date AS TIMESTAMP)) AS created_on,
+       DATE(CAST(closed_date AS TIMESTAMP))  AS closed_on,
 
        -- Request details
        CAST(agency AS STRING) AS agency,
@@ -61,21 +64,23 @@ cleaned AS (
            ELSE TRIM(CAST(descriptor_2 AS STRING))
        END AS descriptor_2,
        UPPER(TRIM(CAST(status AS STRING))) AS status,
+       UPPER(TRIM(CAST(status AS STRING))) = 'CLOSED' AS is_closed,  -- [ERD] fact_table_311_request.is_closed
 
        -- Flag for the June 2024 bulk "administrative" closures of old tickets       -- [CHANGE 4]
        -- (these closed_date values are not real responses and would inflate any time-to-close metric)
        COALESCE(LOWER(resolution_description) LIKE '%administratively closed%', FALSE) AS is_admin_closed,
 
        -- Location - clean zip code, handling several common zip code data problems
+       -- [ERD] dim_location.zipcode is varchar(5) and is shared with the inspections fact,
+       -- so the output is always a 5-digit zip: ZIP+4 values keep their first 5 digits,
+       -- and 'N/A' / 'Anonymous' / anything else becomes NULL. Renamed zip -> zipcode to match the ERD.
        CASE
-           WHEN UPPER(TRIM(CAST(incident_zip AS STRING))) IN ('N/A', 'NA') THEN NULL
-           WHEN UPPER(TRIM(CAST(incident_zip AS STRING))) = 'ANONYMOUS' THEN 'Anonymous'
            -- [CHANGE 5] check that the value is actually digits, not just the right length
            WHEN REGEXP_CONTAINS(TRIM(CAST(incident_zip AS STRING)), r'^\d{5}$')       THEN TRIM(CAST(incident_zip AS STRING))
-           WHEN REGEXP_CONTAINS(TRIM(CAST(incident_zip AS STRING)), r'^\d{9}$')       THEN TRIM(CAST(incident_zip AS STRING))
-           WHEN REGEXP_CONTAINS(TRIM(CAST(incident_zip AS STRING)), r'^\d{5}-\d{4}$') THEN TRIM(CAST(incident_zip AS STRING))
+           WHEN REGEXP_CONTAINS(TRIM(CAST(incident_zip AS STRING)), r'^\d{9}$')       THEN LEFT(TRIM(CAST(incident_zip AS STRING)), 5)
+           WHEN REGEXP_CONTAINS(TRIM(CAST(incident_zip AS STRING)), r'^\d{5}-\d{4}$') THEN LEFT(TRIM(CAST(incident_zip AS STRING)), 5)
            ELSE NULL
-       END AS zip,
+       END AS zipcode,
 
        -- Location - standardized borough, just in case
        CASE
@@ -104,8 +109,8 @@ cleaned AS (
        NULLIF(TRIM(CAST(park_facility_name AS STRING)), 'Unspecified') AS park_facility_name,
        NULLIF(TRIM(CAST(police_precinct AS STRING)), 'Unspecified')    AS police_precinct,
 
-       CAST(latitude AS DECIMAL) AS latitude,
-       CAST(longitude AS DECIMAL) AS longitude,
+       CAST(latitude AS FLOAT64) AS latitude,    -- [ERD] float in the diagram
+       CAST(longitude AS FLOAT64) AS longitude,  -- [ERD] float in the diagram
 
        -- Clearer column name as well for this one
        CAST(open_data_channel_type AS STRING) AS method_of_submission,
@@ -149,12 +154,14 @@ cleaned AS (
    WHERE unique_key IS NOT NULL   -- source has 0 null rows as extracted by KAVITA; kept as a safeguard
    AND created_date IS NOT NULL   -- source has 0 null rows as extracted by KAVITA; kept as a safeguard
 
-   -- [CHANGE 6] fixed start date (dbt variable) instead of a rolling 7-year window.
+   -- [CHANGE 6] fixed date range (dbt variables) instead of a rolling 7-year window.
    -- A rolling window (DATE_SUB(CURRENT_DATE(), INTERVAL 7 YEAR)) moves forward every day,
    -- so each run silently drops the oldest complaints and results are not reproducible.
-   -- DATE() is only used for the comparison; the created_date column itself keeps its time.
-   -- Override at run time with: dbt run --vars '{"start_date_311": "2020-01-01"}'
-   AND DATE(created_date) >= DATE('{{ var("start_date_311", "2019-01-01") }}')
+   -- [GRAIN] project scope confirmed with the professor: 2020 to 2025.
+   -- start_date / end_date are shared with stg_nyc_restaurant_inspections, so both datasets
+   -- always cover the same period. Set them once in dbt_project.yml (vars: start_date / end_date).
+   AND DATE(created_date) BETWEEN DATE('{{ var("start_date", "2020-01-01") }}')
+                              AND DATE('{{ var("end_date", "2025-12-31") }}')
 
    AND borough IS NOT NULL        -- drops 5 null rows (0.01%). Note: 1,118 "Unspecified" rows (1.53%) are NOT null, so they are kept and mapped to 'UNKNOWN or CITYWIDE'
    AND incident_zip IS NOT NULL   -- drops 1,258 null rows (1.72%)
@@ -181,4 +188,4 @@ cleaned AS (
 )
 
 SELECT * FROM cleaned
--- [CHANGE 8] -- All should be part of this table after running: staging_311_secondary 
+-- [CHANGE 8] old comment referred to stg_nyc_311_dot (the DOT model); this is the DOHMH restaurant 311 staging model
