@@ -70,8 +70,4 @@ SELECT * FROM dim_complaint_type
 UNION ALL
 SELECT * FROM unknown_member
 
--- Check every mapping after the build (the list of descriptors is short):
---   SELECT complaint_type, descriptor, complaint_category
---   FROM <marts dataset>.dim_complaint_type
---   ORDER BY complaint_category, descriptor;
--- Pay attention to what lands in 'Other' and 'Food Related'; add a more specific rule above if needed.
+
