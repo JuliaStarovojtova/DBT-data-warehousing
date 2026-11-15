@@ -1,6 +1,8 @@
 -- Purpose: to clean and standardize nyc_restaurant_inspection_secondary_311
 -- Grain: one row per 311 service request (complaint), identified by unique_key.
--- Scope: requests assigned to agency DOHMH with location_type Restaurant or Restaurant/Bar/Deli/Bakery (filtered at extraction).
+-- Scope: requests assigned to agency DOHMH with location_type Restaurant or Restaurant/Bar/Deli/Bakery
+--        (filtered at extraction), created 2020-01-01 through 2025-12-31 (filtered below).
+-- Used by: dim_location, dim_complaint_type, dim_request_channel, dim_date, fact_table_311_request.
 
 WITH source AS (
    SELECT * FROM {{ source('raw', 'nyc_restaurant_inspection_secondary_311') }}
@@ -9,15 +11,17 @@ WITH source AS (
 cleaned AS (
    SELECT
        -- Get all columns from source, except ones we're transforming below
-       -- To do cleaning on them or explicitly cast them as types just in case
+       -- to clean them or explicitly cast them as types
        * EXCEPT (
            unique_key,
            created_date,
            closed_date,
+           resolution_action_updated_date,   -- [CHANGE 1] cast to TIMESTAMP below
            agency,
            agency_name,
            complaint_type,
            descriptor,
+           descriptor_2,                     -- [CHANGE 2] 'N/A' -> NULL below
            status,
            incident_zip,
            borough,
@@ -25,34 +29,59 @@ cleaned AS (
            street_name,
            cross_street_1,
            cross_street_2,
+           intersection_street_1,            -- [CHANGE 3] extra spaces cleaned below
+           intersection_street_2,            -- [CHANGE 3]
+           community_board,                  -- [CHANGE 2] 'Unspecified' -> NULL below
+           park_borough,                     -- [CHANGE 2]
+           park_facility_name,               -- [CHANGE 2]
+           police_precinct,                  -- [CHANGE 2]
            latitude,
            longitude,
            open_data_channel_type
        ),
 
+       -- NOTE on CASTs: most of these columns already have the right type in the source,
+       -- so the CAST does not change the values today. We keep them on purpose as a
+       -- "type contract": if the raw table is ever re-extracted and a column is loaded
+       -- with a different type (e.g. incident_zip as INT64), the staging output stays stable.
+
        -- Identifiers
-       CAST(unique_key AS STRING) AS unique_key, -- this field is already a STRING in the source data, so dont know the true value of CASTing it 
+       CAST(unique_key AS STRING) AS unique_key,
 
        -- Date/Time
-       CAST(created_date AS TIMESTAMP) AS created_date, -- this field is already a TIMESTAMP in the source data, so dont know the true value of CASTing it
-       CAST(closed_date AS TIMESTAMP) AS closed_date, -- this field as well is already a TIMESTAMP in the source data, so dont know the true value of CASTing it
+       CAST(created_date AS TIMESTAMP) AS created_date,
+       CAST(closed_date AS TIMESTAMP) AS closed_date,
+       CAST(resolution_action_updated_date AS TIMESTAMP) AS resolution_action_updated_date, -- [CHANGE 1]
+       -- [ERD] date-only versions, used to build created_date_key / closed_date_key -> dim_date
+       -- (plain DATE(): the times are already NYC local time, so no time zone conversion)
+       DATE(CAST(created_date AS TIMESTAMP)) AS created_on,
+       DATE(CAST(closed_date AS TIMESTAMP))  AS closed_on,
 
        -- Request details
-       CAST(agency AS STRING) AS agency, -- this field is already a STRING in the source data, so dont know the true value of CASTing it 
-       CAST(agency_name AS STRING) AS agency_name, -- this field is already a STRING in the source data, so dont know the true value of CASTing it 
-       CAST(complaint_type AS STRING) AS complaint_type, -- this field is already a STRING in the source data, so dont know the true value of CASTing it 
-       CAST(descriptor AS STRING) AS descriptor, -- this field is already a STRING in the source data, so dont know the true value of CASTing it 
-       UPPER(TRIM(CAST(status AS STRING))) AS status,  -- this field is already a STRING in the source data, so dont know the true value of CASTing it 
+       CAST(agency AS STRING) AS agency,
+       CAST(agency_name AS STRING) AS agency_name,
+       CAST(complaint_type AS STRING) AS complaint_type,
+       CAST(descriptor AS STRING) AS descriptor,
+       CASE                                                           -- [CHANGE 2]
+           WHEN UPPER(TRIM(CAST(descriptor_2 AS STRING))) IN ('N/A', 'NA', 'UNSPECIFIED', '') THEN NULL
+           ELSE TRIM(CAST(descriptor_2 AS STRING))
+       END AS descriptor_2,
+       UPPER(TRIM(CAST(status AS STRING))) AS status,
+       UPPER(TRIM(CAST(status AS STRING))) = 'CLOSED' AS is_closed,  -- [ERD] fact_table_311_request.is_closed
+
+       -- Flag for the June 2024 bulk "administrative" closures of old tickets       -- [CHANGE 4]
+       -- (these closed_date values are not real responses and would inflate any time-to-close metric)
+       COALESCE(LOWER(resolution_description) LIKE '%administratively closed%', FALSE) AS is_admin_closed,
 
        -- Location - clean zip code, handling several common zip code data problems
+       -- [ERD] dim_location.zipcode is varchar(5) and is shared with the inspections fact,
+       -- so the output is always a 5-digit zip: ZIP+4 values keep their first 5 digits,
+       -- and 'N/A' / 'Anonymous' / anything else becomes NULL. Renamed zip -> zipcode to match the ERD.
        CASE
-           WHEN UPPER(TRIM(CAST(incident_zip AS STRING))) IN ('N/A', 'NA') THEN NULL
-           WHEN UPPER(TRIM(CAST(incident_zip AS STRING))) = 'ANONYMOUS' THEN 'Anonymous'
-           WHEN LENGTH(CAST(incident_zip AS STRING)) = 5 THEN CAST(incident_zip AS STRING)
-           WHEN LENGTH(CAST(incident_zip AS STRING)) = 9 THEN CAST(incident_zip AS STRING)
-           WHEN LENGTH(CAST(incident_zip AS STRING)) = 10
-               AND REGEXP_CONTAINS(CAST(incident_zip AS STRING), r'^\d{5}-\d{4}')
-           THEN CAST(incident_zip AS STRING)
+           -- [CHANGE 5] check that the value is actually digits, not just the right length
+           WHEN REGEXP_CONTAINS(TRIM(CAST(incident_zip AS STRING)), r'^\d{5}$')       THEN TRIM(CAST(incident_zip AS STRING))
+           WHEN REGEXP_CONTAINS(TRIM(CAST(incident_zip AS STRING)), r'^\d{9}$')       THEN LEFT(TRIM(CAST(incident_zip AS STRING)), 5)
+           WHEN REGEXP_CONTAINS(TRIM(CAST(incident_zip AS STRING)), r'^\d{5}-\d{4}$') THEN LEFT(TRIM(CAST(incident_zip AS STRING)), 5)
            ELSE NULL
        END AS zipcode,
 
@@ -63,15 +92,28 @@ cleaned AS (
            WHEN UPPER(TRIM(borough)) IN ('BROOKLYN', 'KINGS COUNTY') THEN 'Brooklyn'
            WHEN UPPER(TRIM(borough)) IN ('QUEENS', 'QUEEN', 'QUEENS COUNTY') THEN 'Queens'
            WHEN UPPER(TRIM(borough)) IN ('STATEN ISLAND', 'RICHMOND COUNTY') THEN 'Staten Island'
-           ELSE 'UNKNOWN or CITYWIDE'
+           ELSE 'UNKNOWN or CITYWIDE'   -- includes the "Unspecified" rows
        END AS borough,
 
-       CAST(incident_address AS STRING) AS incident_address,
-       CAST(street_name AS STRING) AS street_name,
-       CAST(cross_street_1 AS STRING) AS cross_street_1,
-       CAST(cross_street_2 AS STRING) AS cross_street_2,
-       CAST(latitude AS DECIMAL) AS latitude,
-       CAST(longitude AS DECIMAL) AS longitude,
+       -- [CHANGE 3] collapse repeated spaces, e.g. 'WEST   26 STREET' -> 'WEST 26 STREET'
+       REGEXP_REPLACE(TRIM(CAST(incident_address AS STRING)), r'\s+', ' ')      AS incident_address,
+       REGEXP_REPLACE(TRIM(CAST(street_name AS STRING)), r'\s+', ' ')           AS street_name,
+       REGEXP_REPLACE(TRIM(CAST(cross_street_1 AS STRING)), r'\s+', ' ')        AS cross_street_1,
+       REGEXP_REPLACE(TRIM(CAST(cross_street_2 AS STRING)), r'\s+', ' ')        AS cross_street_2,
+       REGEXP_REPLACE(TRIM(CAST(intersection_street_1 AS STRING)), r'\s+', ' ') AS intersection_street_1,
+       REGEXP_REPLACE(TRIM(CAST(intersection_street_2 AS STRING)), r'\s+', ' ') AS intersection_street_2,
+
+       -- [CHANGE 2] "Unspecified" is a placeholder, not a real value -> NULL
+       CASE
+           WHEN UPPER(TRIM(CAST(community_board AS STRING))) IN ('0 UNSPECIFIED', 'UNSPECIFIED') THEN NULL
+           ELSE TRIM(CAST(community_board AS STRING))
+       END AS community_board,
+       NULLIF(TRIM(CAST(park_borough AS STRING)), 'Unspecified')       AS park_borough,
+       NULLIF(TRIM(CAST(park_facility_name AS STRING)), 'Unspecified') AS park_facility_name,
+       NULLIF(TRIM(CAST(police_precinct AS STRING)), 'Unspecified')    AS police_precinct,
+
+       CAST(latitude AS FLOAT64) AS latitude,    -- [ERD] float in the diagram
+       CAST(longitude AS FLOAT64) AS longitude,  -- [ERD] float in the diagram
 
        -- Clearer column name as well for this one
        CAST(open_data_channel_type AS STRING) AS method_of_submission,
@@ -83,16 +125,15 @@ cleaned AS (
 
    -- Filters
 
-   -- Remember: Grain is one row per 311 service request (complaint), identified by unique_key.
-   -- Scope: requests assigned to agency DOHMH with location_type Restaurant or Restaurant/Bar/Deli/Bakery.  
-   -- However, we realized we do not need to filter by agency, agency_name, nor location_type because the source raw data 
-   -- that KAVITA extracted from NYC Open Data was already filtered by agency at the time of extraction.
-   -- However, to verify these assumtions and be able explain them in official documentation, we went to BQ and ran sql queries to verify them as follows:
-   
+   -- Remember: The grain is one 311 service request (complaint) responded to by DOHMH for Restaurant and Restaurant/Bar/Deli/Bakery location types.
+   -- We do not need to filter by agency, agency_name, or location_type because the raw data
+   -- KAVITA extracted from NYC Open Data was already filtered at the time of extraction.
+   -- To verify these assumptions and be able to explain them in official documentation, we ran these queries in BQ:
+
         -- SELECT
         -- COUNT(DISTINCT agency_name) AS distinct_agency_count
         -- FROM `josedata26.nyc_restaurant_data_analysis.nyc_restaurant_inspection_secondary_311`;
-   
+
         -- SELECT
         -- agency_name,
         -- COUNT(*)                                            AS row_count,
@@ -104,7 +145,7 @@ cleaned AS (
         -- SELECT
         -- COUNT(DISTINCT location_type) AS distinct_location_type
         -- FROM `josedata26.nyc_restaurant_data_analysis.nyc_restaurant_inspection_secondary_311`;
-        
+
         -- SELECT
         -- location_type,
         -- COUNT(*)                                            AS row_count,
@@ -112,18 +153,22 @@ cleaned AS (
         -- FROM `josedata26.nyc_restaurant_data_analysis.nyc_restaurant_inspection_secondary_311`
         -- GROUP BY location_type
         -- ORDER BY row_count DESC;
-     
-   WHERE unique_key IS NOT NULL -- using this even though source data has 0 rows with null values, as extracted by KAVITA
-   AND created_date IS NOT NULL -- using this even though source data has 0 rows with null values, as extracted by KAVITA
-   AND CAST(created_date AS DATE) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 YEAR) 
-        -- Using this even though we are aware that this line has 2 effects:
-        -- 1: it removes the time portion
-        -- 2: it keeps only complaints created in the last 7 years, counted back from the day the query runs, which ultimately means each run will return a different set of rows
-        -- QUESTION: Could it quietly drop history from our fact table in the future? 
-        -- QUESTION: If so, should we use a fixed cutoff or a dbt variable instead? Example: AND DATE(created_date) >= DATE('{{ var("start_date", "2019-01-01") }}')
-   AND borough IS NOT NULL -- using this because source data has 5 rows with null values representing a 0.01% of rows; and 1118 "Unspecified" values representing 1.53% of rows
-   AND incident_zip IS NOT NULL -- using this because source has 1258 rows with null values representing a 1.72% of rows
-        -- Below is query used in BQ to explore the source data set for null values in important fields
+
+   WHERE unique_key IS NOT NULL   -- source has 0 null rows as extracted by KAVITA; kept as a safeguard
+   AND created_date IS NOT NULL   -- source has 0 null rows as extracted by KAVITA; kept as a safeguard
+
+   -- [CHANGE 6] fixed date range (dbt variables) instead of a rolling 7-year window.
+   -- A rolling window (DATE_SUB(CURRENT_DATE(), INTERVAL 7 YEAR)) moves forward every day,
+   -- so each run silently drops the oldest complaints and results are not reproducible.
+   -- [GRAIN] project scope confirmed with the professor: 2020 to 2025.
+   -- start_date / end_date are shared with stg_nyc_restaurant_inspections, so both datasets
+   -- always cover the same period. Set them once in dbt_project.yml (vars: start_date / end_date).
+   AND DATE(created_date) BETWEEN DATE('{{ var("start_date", "2020-01-01") }}')
+                              AND DATE('{{ var("end_date", "2025-12-31") }}')
+
+   AND borough IS NOT NULL        -- drops 5 null rows (0.01%). Note: 1,118 "Unspecified" rows (1.53%) are NOT null, so they are kept and mapped to 'UNKNOWN or CITYWIDE'
+   AND incident_zip IS NOT NULL   -- drops 1,258 null rows (1.72%)
+        -- Query used in BQ to explore the source data for null values in important fields:
             -- SELECT
             -- COUNT(*)                          AS total_rows,
             -- COUNTIF(unique_key IS NULL)       AS null_unique_key,
@@ -136,8 +181,15 @@ cleaned AS (
             -- FROM `josedata26.nyc_restaurant_data_analysis.nyc_restaurant_inspection_secondary_311`;
 
    -- Deduplicate
-   QUALIFY ROW_NUMBER() OVER (PARTITION BY unique_key ORDER BY created_date DESC) = 1
+   -- [CHANGE 7] keep the most recently UPDATED version of a request. Duplicates of the same
+   -- unique_key normally share the same created_date, so ordering by created_date alone
+   -- picks a random row; the last update / close date breaks the tie.
+   QUALIFY ROW_NUMBER() OVER (
+       PARTITION BY unique_key
+       ORDER BY resolution_action_updated_date DESC, closed_date DESC, created_date DESC
+   ) = 1
 )
 
 SELECT * FROM cleaned
--- All should be part of this table after running: stg_nyc_311_dot
+-- This model is staging_311_secondary (secondary dataset: DOHMH 311 restaurant complaints)
+-- [CHANGE 8] old comment referred to stg_nyc_311_dot (the DOT model)
